@@ -263,16 +263,24 @@ class GaussianModel:
 
     # 更新学习率
     def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
+        ''' 每一步迭代的学习率调度 '''
+
+        # 如果没有使用预训练曝光值（即pretrained_exposures为None）
         if self.pretrained_exposures is None:
+            # 对于曝光优化器（exposure_optimizer）中的每个参数组，更新其学习率
             for param_group in self.exposure_optimizer.param_groups:
+                # 使用预定义的学习率调度函数（exposure_scheduler_args）来更新学习率
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
 
+        # 对于主优化器（optimizer）中的每个参数组，检查是否需要更新学习率
         for param_group in self.optimizer.param_groups:
-            # 如果识别到参数是xyz，对学习率进行优化，优化后的学习率传回参数
+            # 如果当前参数组的名称是 "xyz"，则更新该组的学习率
             if param_group["name"] == "xyz":
+                # 使用 xyz 参数调度函数（xyz_scheduler_args）来计算该参数组的学习率
                 lr = self.xyz_scheduler_args(iteration)
+                # 将计算后的学习率赋值给该参数组
                 param_group['lr'] = lr
+                # 返回更新后的学习率
                 return lr
 
     # 从参数里面创建列表
@@ -569,6 +577,14 @@ class GaussianModel:
     # 添加自适应密度控制过程中的状态，就是记录需要累加的梯度
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         # 累计梯度，把x和y方向上的梯度给标记起来，添加到对应的计数器
+        # 计算并累积与视空间点相关的梯度信息（这里只关注前两个维度，即x和y方向的梯度）
+        # `viewspace_point_tensor.grad` 代表该视空间点的梯度
+        # `update_filter` 是一个布尔数组，用来筛选出需要更新的点
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        # 每处理一个点，就给分母+1
+        # `torch.norm` 计算梯度的范数，dim=-1 表示计算每个点在最后一个维度的范数，keepdim=True 保持维度不变
+        # 这里假设我们只关心 x 和 y 方向的梯度，因此对 `viewspace_point_tensor.grad[update_filter,:2]` 进行了切片
+        # 累积计数，统计每个点更新的次数
+        # `denom` 用于存储每个点的更新次数，`update_filter` 用来筛选出需要更新的点
+        # 每处理一个点，就给分母+1,因为要计算平均梯度
         self.denom[update_filter] += 1
+
