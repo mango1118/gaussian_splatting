@@ -43,21 +43,25 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     # 检查是否可以使用 Sparse Adam 优化器。如果不可用且用户选择了 Sparse Adam，程序退出
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
-        sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+        sys.exit(
+            f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0  # 初始化从哪个迭代开始
     tb_writer = prepare_output_and_logger(dataset)  # 初始化 TensorBoard 日志记录器
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)  # 创建高斯模型
+    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)  # 创建高斯模型对象
     scene = Scene(dataset, gaussians)  # 创建场景对象，包含数据集和高斯模型
     gaussians.training_setup(opt)  # 设置高斯模型的训练配置
-    if checkpoint:  # 如果提供了检查点，则恢复模型参数
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
 
-    # 根据数据集的设置，决定背景颜色（白色或黑色）
+    # 如果提供了检查点文件，则从中恢复模型参数
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)  # 加载检查点
+        gaussians.restore(model_params, opt)  # 恢复高斯模型的参数
+
+    # 根据数据集设置背景颜色（白色或黑色）
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")  # 将背景颜色转换为张量并放到 GPU 上
 
@@ -67,30 +71,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # 检查是否使用 Sparse Adam 优化器
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
-    # 创建一个指数衰减的深度 L1 权重函数
+
+    # 创建一个深度 L1 权重的指数衰减函数
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()  # 获取训练用的相机列表
-    viewpoint_indices = list(range(len(viewpoint_stack)))  # 创建一个相机索引列表
-    ema_loss_for_log = 0.0  # 用于计算损失的指数滑动平均
-    ema_Ll1depth_for_log = 0.0  # 用于计算深度损失的指数滑动平均
+    # 获取训练用的相机列表，并创建一个相机索引列表
+    viewpoint_stack = scene.getTrainCameras().copy()
+    viewpoint_indices = list(range(len(viewpoint_stack)))
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")  # 创建一个进度条
+    # 初始化指数滑动平均损失
+    ema_loss_for_log = 0.0
+    ema_Ll1depth_for_log = 0.0
+
+    # 创建一个进度条，显示训练进度
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
     for iteration in range(first_iter, opt.iterations + 1):
         # 检查并处理网络 GUI 连接
         if network_gui.conn == None:
             network_gui.try_connect()
+
         while network_gui.conn != None:
             try:
                 net_image_bytes = None
                 # 接收来自 GUI 的数据并进行渲染
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+
                 if custom_cam != None:
                     # 使用自定义相机进行渲染
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer,
+                                       use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)[
+                        "render"]
                     # 将渲染图像转换为字节格式并发送回 GUI
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2,
+                                                                                                               0).contiguous().cpu().numpy())
+
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
                     break
@@ -102,14 +118,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 更新学习率
         gaussians.update_learning_rate(iteration)
 
-        # 每1000次迭代时，增加 SH (Spherical Harmonics) 的级别，直到达到最大级别
+        # 每1000次迭代时，增加SH的级别，直到达到最大级别
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # 从可用的相机中随机选择一个
+        # 从可用的相机中随机选择一个相机
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()  # 如果没有可用的相机，则重新加载
             viewpoint_indices = list(range(len(viewpoint_stack)))  # 重新创建相机索引列表
+
         rand_idx = randint(0, len(viewpoint_indices) - 1)  # 随机选择一个相机的索引
         viewpoint_cam = viewpoint_stack.pop(rand_idx)  # 从相机堆栈中取出相机
         vind = viewpoint_indices.pop(rand_idx)  # 从索引堆栈中移除已选择的索引
@@ -122,8 +139,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         # 渲染当前相机视角的图像
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE)
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], \
+        render_pkg["visibility_filter"], render_pkg["radii"]
 
         # 如果相机包含 alpha mask，则进行处理
         if viewpoint_cam.alpha_mask is not None:
@@ -168,13 +187,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # 每10次迭代更新一次进度条
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix(
+                    {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # 记录训练报告，包括损失、时间等信息
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+                            testing_iterations, scene, render,
+                            (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp),
+                            dataset.train_test_exp)
 
             # 每隔一段时间保存高斯模型
             if (iteration in saving_iterations):
@@ -182,28 +205,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # 模型密度更新：用于增加或修剪高斯密度
-            if iteration < opt.densify_until_iter:
+            if iteration < opt.densify_until_iter:  # 如果当前迭代小于最大密度更新迭代次数
                 # 更新图像空间中的最大半径值
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
+                                                                     radii[visibility_filter])
+                # 更新密度扩展的统计数据
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+                # 每隔一段时间（根据设置的 densification_interval），进行密度更新和修剪
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    # 根据迭代次数决定是否应用大小阈值来限制密度的增长（例如，大于一定尺寸的点才会被扩展）
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    # 调用 densify_and_prune 函数来增加密度并修剪过大的高斯体积
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,
+                                                radii)
 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                # 在设定的间隔（opacity_reset_interval）进行透明度重置，或者如果数据集使用白色背景时进行重置
+                if iteration % opt.opacity_reset_interval == 0 or (
+                        dataset.white_background and iteration == opt.densify_from_iter):
+                    # 重置高斯的透明度（可能是为了避免过多高斯体积影响训练效果）
                     gaussians.reset_opacity()
 
             # 执行优化步骤，更新高斯模型的参数
-            if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()  # 执行曝光优化器的步骤
-                gaussians.exposure_optimizer.zero_grad(set_to_none=True)  # 清空梯度
+            if iteration < opt.iterations:  # 如果当前迭代次数小于设定的总迭代次数
+                # 执行曝光优化器的步骤（更新与曝光相关的高斯参数）
+                gaussians.exposure_optimizer.step()
+                # 清空曝光优化器的梯度
+                gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+
+                # 判断是否使用 Sparse Adam 优化器，如果是，则仅对有效的（半径大于 0 的）高斯体积进行优化
                 if use_sparse_adam:
-                    visible = radii > 0  # 仅对半径大于0的高斯体积进行优化
-                    gaussians.optimizer.step(visible, radii.shape[0])  # 执行 Sparse Adam 优化步骤
+                    # 仅对半径大于 0 的高斯体积进行优化
+                    visible = radii > 0
+                    # 执行 Sparse Adam 优化步骤，只优化可见的高斯体积
+                    gaussians.optimizer.step(visible, radii.shape[0])
+                    # 清空优化器的梯度
                     gaussians.optimizer.zero_grad(set_to_none=True)
                 else:
-                    gaussians.optimizer.step()  # 执行标准优化步骤
+                    # 如果没有使用 Sparse Adam，则执行标准的优化步骤
+                    gaussians.optimizer.step()
+                    # 清空优化器的梯度
                     gaussians.optimizer.zero_grad(set_to_none=True)
 
             # 保存检查点（每隔一定步数）
