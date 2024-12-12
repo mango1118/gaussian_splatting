@@ -209,14 +209,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # 更新图像空间中的最大半径值
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
                                                                      radii[visibility_filter])
-                # 更新密度扩展的统计数据
+                # 更新密度扩展的统计数据,就是梯度信息累加
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 # 每隔一段时间（根据设置的 densification_interval），进行密度更新和修剪
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     # 根据迭代次数决定是否应用大小阈值来限制密度的增长（例如，大于一定尺寸的点才会被扩展）
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    # 调用 densify_and_prune 函数来增加密度并修剪过大的高斯体积
+                    # 调用 densify_and_prune 函数来增加密度并修剪过大的高斯体积，或是复制小高斯
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,
                                                 radii)
 
