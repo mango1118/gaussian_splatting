@@ -415,7 +415,7 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    # 重置点，在做高斯点的修剪，不需要的高斯点就用mask删掉
+    # 删除点，在做高斯点的修剪，不需要的高斯点就用mask删掉
     def prune_points(self, mask):
         # 选择要保留哪些点
         valid_points_mask = ~mask
@@ -434,27 +434,48 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
-    # 创建新的张量并存到优化器里
+    # 将新的张量合并到优化器中，适用于扩展模型参数
     def cat_tensors_to_optimizer(self, tensors_dict):
-        optimizable_tensors = {}
+        """
+        将新的张量合并到优化器的参数中，并更新优化器的状态。
+        参数:
+            tensors_dict (dict): 包含扩展张量的字典，键是参数名称，值是对应的扩展张量。
+        返回:
+            optimizable_tensors (dict): 更新后的优化器可优化参数字典，键是参数名称，值是合并后的张量。
+        """
+        optimizable_tensors = {}  # 存储更新后的可优化张量
+
+        # 遍历优化器中的所有参数组（param_groups）
         for group in self.optimizer.param_groups:
+            # 确保每个参数组只有一个参数
             assert len(group["params"]) == 1
+            # 获取当前参数组对应的扩展张量
             extension_tensor = tensors_dict[group["name"]]
+            # 获取该参数在优化器中的存储状态（如果存在的话）
             stored_state = self.optimizer.state.get(group['params'][0], None)
+            # 如果该参数已经存在优化器状态中（即该参数已经被优化过），则进行扩展
             if stored_state is not None:
-
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
-
+                # 将“exp_avg”和“exp_avg_sq”扩展，补齐与新参数形状一致的零张量
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)),
+                                                    dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
+                                                       dim=0)
+                # 删除原先的参数状态（已扩展过的参数将会重新计算）
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                # 将原参数和扩展张量连接，创建新的可训练参数，并将其赋值为新的参数组
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                # 将扩展后的参数状态重新存入优化器的状态字典
                 self.optimizer.state[group['params'][0]] = stored_state
-
+                # 将更新后的参数添加到可优化参数字典中
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                # 如果优化器中没有该参数的状态，直接将原始参数与扩展张量连接
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                # 将新参数添加到可优化参数字典中
                 optimizable_tensors[group["name"]] = group["params"][0]
-
+        # 返回更新后的可优化参数字典
         return optimizable_tensors
 
     # 给自适应密度添加新的高斯点要用到的函数
@@ -467,6 +488,7 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation}
         # 调用创建优化器的方法，将这些属性添加到优化器里
+        # 创建一个优化器张量
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         # 把新的值赋给新的对象，创造新的高斯点
         self._xyz = optimizable_tensors["xyz"]
@@ -529,12 +551,13 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         # 高斯分布的梯度的阈值大于设定的梯度阈值，就要进行克隆，判断形状是否小于场景设定的形状范围
+        # 同样是一个张量
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         # 满足条件就要标记为需要克隆
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
-        # 原高斯分布的所有变量都添加到新变量里，增加一个新高斯
+        # 原高斯分布的所有变量都添加到新变量里，增加一群新高斯（用tensor标记）
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -546,35 +569,76 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    # 高斯椭球的剔除
+    # 高斯椭球的剔除与密度调整
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
-        # 梯度的累加值除以分母，得到平均梯度
+        """
+        对高斯椭球进行密度调整（densify）和剔除（prune）的操作。
+
+        参数:
+            max_grad (float): 最大允许的梯度，用于控制分裂和克隆。
+            min_opacity (float): 最小不透明度阈值，低于该值的高斯椭球将被剔除。
+            extent (float): 场景范围，通常用于归一化或大小判断。
+            max_screen_size (float or None): 屏幕上允许的最大高斯椭球半径，超过该值的椭球将被剔除。
+            radii (torch.Tensor): 当前高斯椭球的半径张量。
+
+        主要步骤:
+        1. 计算梯度，归零所有无效值（NaN）。
+        2. 调用克隆和分裂函数，调整高斯椭球的密度。
+        3. 根据不透明度、屏幕尺寸和场景范围剔除不符合要求的高斯椭球。
+        4. 清理中间变量，释放显存。
+        """
+        # 1. 计算梯度平均值
+        # 使用累计梯度值（xyz_gradient_accum）除以分母（denom）得到平均梯度。
+        # grads 是一个一维张量，代表每个高斯椭球的梯度强度。
         grads = self.xyz_gradient_accum / self.denom
-        # 归零操作
+
+        # 处理无效值：将 grads 中的所有 NaN 值替换为 0。
         grads[grads.isnan()] = 0.0
 
-        # 进行分裂和克隆
+        # 2. 调整高斯椭球的密度
+        # 将当前高斯椭球半径临时存储，以便后续操作。
         self.tmp_radii = radii
+
+        # 调用密度调整方法:
+        # densify_and_clone: 根据梯度和场景范围克隆高斯椭球。
         self.densify_and_clone(grads, max_grad, extent)
+        # densify_and_split: 根据梯度和场景范围分裂高斯椭球。
         self.densify_and_split(grads, max_grad, extent)
 
-        # 如果高斯椭球的不透明度小于设定的最低不透明度，就标记出来
+        # 3. 创建剔除掩码
+        # 根据不透明度阈值剔除：创建布尔张量 prune_mask，
+        # 标记所有不透明度低于 min_opacity 的高斯椭球。
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+
+        # 如果设置了屏幕尺寸约束（max_screen_size 不为 None），则进行进一步剔除。
         if max_screen_size:
-            # 二维高斯分布的半径大于最大的屏幕尺寸，也标记
+            # 检查二维高斯分布半径是否超过屏幕允许的最大尺寸。
             big_points_vs = self.max_radii2D > max_screen_size
-            # 高斯分布的大小大于场景范围*0.1，也标记
+            # 检查高斯分布的三维尺度是否超过场景范围的 10%。
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            # 为这些高斯椭球设置一个掩码，同一剔除
+
+            # 合并剔除条件：如果某个高斯椭球满足任一条件，则标记为需要剔除。
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        # 根据剔除掩码（prune_mask）执行剔除操作。
         self.prune_points(prune_mask)
+
+        # 恢复临时存储的半径信息并清理。
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
-        # 清除缓存
+        # 4. 清理缓存
+        # 调用 PyTorch 的显存清理函数，释放未使用的显存以优化内存使用。
         torch.cuda.empty_cache()
 
     # 添加自适应密度控制过程中的状态，就是记录需要累加的梯度
+    '''
+    整体流程总结：
+    计算每个点的梯度大小：首先，通过 viewspace_point_tensor.grad[update_filter, :2] 获取需要更新的点在 x 和 y 方向上的梯度值。
+    计算梯度的范数：然后，使用 torch.norm(..., dim=-1, keepdim=True) 计算这些梯度的 L2 范数，即每个点在 x 和 y 方向上的梯度强度。
+    累积梯度信息：最后，将计算得到的梯度范数累加到 self.xyz_gradient_accum[update_filter] 中，以跟踪这些点的梯度变化。
+    每处理一个点，就给分母+1,因为要计算平均梯度
+    '''
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         # 累计梯度，把x和y方向上的梯度给标记起来，添加到对应的计数器
         # 计算并累积与视空间点相关的梯度信息（这里只关注前两个维度，即x和y方向的梯度）
@@ -585,6 +649,6 @@ class GaussianModel:
         # 这里假设我们只关心 x 和 y 方向的梯度，因此对 `viewspace_point_tensor.grad[update_filter,:2]` 进行了切片
         # 累积计数，统计每个点更新的次数
         # `denom` 用于存储每个点的更新次数，`update_filter` 用来筛选出需要更新的点
-        # 每处理一个点，就给分母+1,因为要计算平均梯度
+        # 每为高斯点累计一次梯度，就给它的计数+1，因为后续要作为分母得到每个高斯点的平均梯度
         self.denom[update_filter] += 1
 
