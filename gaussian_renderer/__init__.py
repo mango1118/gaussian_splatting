@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-
+# 这段代码是一个用于渲染场景的函数，主要是通过将高斯分布的点投影到2D屏幕上来生成渲染图像。
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, separate_sh=False,
            override_color=None, use_trained_exp=False):
     """
@@ -41,12 +41,13 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     # 创建一个与pc中的xyz坐标形状相同的零张量，用于在计算过程中返回2D（屏幕空间）均值的梯度
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
-        screenspace_points.retain_grad()  # 保留梯度，以便计算梯度
+        screenspace_points.retain_grad()  # 这段代码是一个用于渲染场景的函数，主要是通过将高斯分布的点投影到2D屏幕上来生成渲染图像。
     except:
         pass
 
     # Set up rasterization configuration
     # 设置光栅化配置参数
+    # 计算视场的 tan 值，这将用于设置光栅化配置。
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)  # 水平视场角的切线值
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)  # 垂直视场角的切线值
 
@@ -72,7 +73,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     # 获取高斯模型的3D均值、2D均值和不透明度信息
     means3D = pc.get_xyz  # 物体的3D均值（高斯分布的中心）
-    means2D = screenspace_points  # 物体在2D图像中的投影
+    means2D = screenspace_points  # 物体在2D图像中的投影坐标
     opacity = pc.get_opacity  # 物体的透明度
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -97,10 +98,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         if pipe.convert_SHs_python:  # 是否将SH特征转换为RGB颜色
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)  # 转置并调整SH特征的形状
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0],
-                                                                         1))  # 计算相机视角下每个点的方向向量
+                                                                         1))  # 计算相机中心到每个点的方向向量
             dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)  # 将方向向量归一化
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)  # 使用SH转换为RGB颜色
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)  # 计算的颜色进行修剪，确保大于0
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized) # 使用SH特征将方向向量转换为RGB颜色。
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0) # RGB颜色的范围限制在0到1之间。
         else:
             if separate_sh:  # 如果需要分离SH特征
                 dc, shs = pc.get_features_dc, pc.get_features_rest  # 分离SH特征

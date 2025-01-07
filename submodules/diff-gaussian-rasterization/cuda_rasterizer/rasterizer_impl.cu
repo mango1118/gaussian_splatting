@@ -9,135 +9,163 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
-#include "rasterizer_impl.h"
-#include <iostream>
-#include <fstream>
-#include <algorithm>
-#include <numeric>
-#include <cuda.h>
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-#include <cub/cub.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#define GLM_FORCE_CUDA
-#include <glm/glm.hpp>
+#include "rasterizer_impl.h"   // 自定义的光栅化实现相关头文件
+#include <iostream>             // 用于输入输出流（如打印日志）
+#include <fstream>              // 用于文件操作
+#include <algorithm>            // 用于常见的算法操作（如排序）
+#include <numeric>              // 用于数字计算（如累加）
+#include <cuda.h>               // CUDA API
+#include "cuda_runtime.h"       // CUDA运行时API
+#include "device_launch_parameters.h" // 用于设备的启动参数
+#include <cub/cub.cuh>          // CUB库：CUDA高级算法库
+#include <cub/device/device_radix_sort.cuh> // CUB设备排序算法（基数排序）
+#define GLM_FORCE_CUDA          // 强制启用CUDA支持的GLM（数学库）
+#include <glm/glm.hpp>          // GLM：OpenGL数学库
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-namespace cg = cooperative_groups;
+#include <cooperative_groups.h> // 协同组（cooperative groups）头文件，用于高效的线程协同计算
+#include <cooperative_groups/reduce.h> // 协同组的归约（reduction）操作
+namespace cg = cooperative_groups;  // 简化命名空间为cg
 
-#include "auxiliary.h"
-#include "forward.h"
-#include "backward.h"
+#include "auxiliary.h"          // 辅助函数的头文件
+#include "forward.h"            // 向前传播相关的头文件
+#include "backward.h"           // 向后传播相关的头文件
+
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
 {
-	uint32_t msb = sizeof(n) * 4;
-	uint32_t step = msb;
-	while (step > 1)
-	{
-		step /= 2;
-		if (n >> msb)
-			msb += step;
-		else
-			msb -= step;
-	}
-	if (n >> msb)
-		msb++;
-	return msb;
+    uint32_t msb = sizeof(n) * 4;  // 计算32位整数的位数（通常为32）
+    uint32_t step = msb;           // 步长初始化为msb的值
+    while (step > 1)               // 当步长大于1时，继续调整
+    {
+        step /= 2;                  // 每次将步长减半
+        if (n >> msb)               // 检查n的高位是否为1
+            msb += step;            // 如果是，msb增加步长
+        else
+            msb -= step;            // 否则，msb减小步长
+    }
+    if (n >> msb)                   // 最终检查高位的值
+        msb++;                       // 如果是1，则msb增加
+    return msb;
 }
+
 
 // Wrapper method to call auxiliary coarse frustum containment test.
 // Mark all Gaussians that pass it.
 __global__ void checkFrustum(int P,
-	const float* orig_points,
-	const float* viewmatrix,
-	const float* projmatrix,
-	bool* present)
+    const float* orig_points,
+    const float* viewmatrix,
+    const float* projmatrix,
+    bool* present)
 {
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P)
-		return;
+    // 获取当前线程的索引
+    auto idx = cg::this_grid().thread_rank();
+    
+    // 如果线程的索引超出了需要处理的点数量P，则返回
+    if (idx >= P)
+        return;
 
-	float3 p_view;
-	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
+    float3 p_view;
+    
+    // 使用辅助函数in_frustum进行视锥体内检测，p_view是检测过程中使用的视图坐标
+    present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
+
 
 // Generates one key/value pair for all Gaussian / tile overlaps. 
 // Run once per Gaussian (1:N mapping).
 __global__ void duplicateWithKeys(
-	int P,
-	const float2* points_xy,
-	const float* depths,
-	const uint32_t* offsets,
-	uint64_t* gaussian_keys_unsorted,
-	uint32_t* gaussian_values_unsorted,
-	int* radii,
-	dim3 grid)
+    int P,
+    const float2* points_xy,
+    const float* depths,
+    const uint32_t* offsets,
+    uint64_t* gaussian_keys_unsorted,
+    uint32_t* gaussian_values_unsorted,
+    int* radii,
+    dim3 grid)
 {
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P)
-		return;
+    // 获取当前线程在网格中的索引
+    auto idx = cg::this_grid().thread_rank();
+    
+    // 如果当前线程的索引超出点的总数P，则返回
+    if (idx >= P)
+        return;
 
-	// Generate no key/value pair for invisible Gaussians
-	if (radii[idx] > 0)
-	{
-		// Find this Gaussian's offset in buffer for writing keys/values.
-		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-		uint2 rect_min, rect_max;
+    // 如果高斯的半径大于0，说明它是可见的
+    if (radii[idx] > 0)
+    {
+        // 查找当前高斯的偏移量，用于写入键值对
+        uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+        uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+        // 获取该高斯所在的矩形区域的最小和最大坐标
+        getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-		// For each tile that the bounding rect overlaps, emit a 
-		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the Gaussian. Sorting the values 
-		// with this key yields Gaussian IDs in a list, such that they
-		// are first sorted by tile and then by depth. 
-		for (int y = rect_min.y; y < rect_max.y; y++)
-		{
-			for (int x = rect_min.x; x < rect_max.x; x++)
-			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
-				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
-				off++;
-			}
-		}
-	}
+        // 遍历该高斯的矩形区域，检查它与哪些瓦片有重叠
+        // 对于每个与该高斯重叠的瓦片，生成一个键值对
+        // 键是 | tile ID | depth |，值是高斯的 ID
+        for (int y = rect_min.y; y < rect_max.y; y++)
+        {
+            for (int x = rect_min.x; x < rect_max.x; x++)
+            {
+                // 计算当前瓦片的 ID
+                uint64_t key = y * grid.x + x;
+                key <<= 32;  // 将瓦片 ID 移到高位
+                key |= *((uint32_t*)&depths[idx]);  // 将该高斯的深度值放入低位
+
+                // 存储键值对
+                gaussian_keys_unsorted[off] = key;
+                gaussian_values_unsorted[off] = idx;
+
+                // 更新偏移量
+                off++;
+            }
+        }
+    }
 }
+
 
 // Check keys to see if it is at the start/end of one tile's range in 
 // the full sorted list. If yes, write start/end of this tile. 
 // Run once per instanced (duplicated) Gaussian ID.
 __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
 {
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= L)
-		return;
+    // 获取当前线程在网格中的索引
+    auto idx = cg::this_grid().thread_rank();
+    
+    // 如果当前线程的索引大于高斯点总数L，则跳过当前线程
+    if (idx >= L)
+        return;
 
-	// Read tile ID from key. Update start/end of tile range if at limit.
-	uint64_t key = point_list_keys[idx];
-	uint32_t currtile = key >> 32;
-	if (idx == 0)
-		ranges[currtile].x = 0;
-	else
-	{
-		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
-		if (currtile != prevtile)
-		{
-			ranges[prevtile].y = idx;
-			ranges[currtile].x = idx;
-		}
-	}
-	if (idx == L - 1)
-		ranges[currtile].y = L;
+    // 从键中读取瓦片 ID，键的高位存储的是瓦片 ID，低位是深度信息
+    uint64_t key = point_list_keys[idx];
+    uint32_t currtile = key >> 32;  // 提取当前高斯所在瓦片的 ID
+
+    // 如果是第一个元素，设置当前瓦片的开始位置
+    if (idx == 0)
+        ranges[currtile].x = 0;
+    else
+    {
+        // 获取前一个高斯所在瓦片的 ID
+        uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+        
+        // 如果当前瓦片与前一个瓦片不同，更新前一个瓦片的结束位置
+        if (currtile != prevtile)
+        {
+            ranges[prevtile].y = idx;  // 更新前一个瓦片的结束位置
+            ranges[currtile].x = idx;  // 设置当前瓦片的开始位置
+        }
+    }
+
+    // 如果是最后一个元素，设置当前瓦片的结束位置
+    if (idx == L - 1)
+        ranges[currtile].y = L;
 }
 
+
 // Mark Gaussians as visible/invisible, based on view frustum testing
+// 通过视锥体测试标记哪些高斯点是可见的
 void CudaRasterizer::Rasterizer::markVisible(
 	int P,
 	float* means3D,
@@ -152,6 +180,7 @@ void CudaRasterizer::Rasterizer::markVisible(
 		present);
 }
 
+// 从chunk缓冲区提取和初始化GeometryState结构
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
 	GeometryState geom;

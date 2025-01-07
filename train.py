@@ -9,19 +9,20 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import os  # 用于文件和路径操作
-import torch  # PyTorch 深度学习库
-from random import randint  # 用于生成随机数
-from utils.loss_utils import l1_loss, ssim  # 导入L1损失和SSIM损失函数
-from gaussian_renderer import render, network_gui  # 导入渲染函数和GUI工具
-import sys  # 系统操作
-from scene import Scene, GaussianModel  # 场景和高斯模型
-from utils.general_utils import safe_state, get_expon_lr_func  # 一些常用工具函数
-import uuid  # 生成唯一标识符
-from tqdm import tqdm  # 进度条
-from utils.image_utils import psnr  # PSNR图像质量评估
-from argparse import ArgumentParser, Namespace  # 处理命令行参数
-from arguments import ModelParams, PipelineParams, OptimizationParams  # 定义模型、管道和优化参数类
+import os
+import torch
+from random import randint
+from utils.loss_utils import l1_loss, ssim
+from gaussian_renderer import render, network_gui
+import sys
+from scene import Scene, GaussianModel
+from utils.general_utils import safe_state, get_expon_lr_func
+import uuid
+from tqdm import tqdm
+from utils.image_utils import psnr
+from argparse import ArgumentParser, Namespace
+from arguments import ModelParams, PipelineParams, OptimizationParams
+from datetime import datetime
 
 # 尝试导入TensorBoard相关模块
 try:
@@ -182,6 +183,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         with torch.no_grad():
             # 更新指数滑动平均损失
+            # 损失刚开始可能会出现较大波动，用指数滑动平均减少这种波动，更好地查看模型的长期表现
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
@@ -214,16 +216,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # 每隔一段时间（根据设置的 densification_interval），进行密度更新和修剪
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    # 根据迭代次数决定是否应用大小阈值来限制密度的增长（例如，大于一定尺寸的点才会被扩展）
+                    # 根据迭代次数决定是否应用大小阈值来限制密度的增长（大于一定尺寸的点才会被扩展）
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     # 调用 densify_and_prune 函数来增加密度并修剪过大的高斯体积，或是复制小高斯
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,
                                                 radii)
 
-                # 在设定的间隔（opacity_reset_interval）进行透明度重置，或者如果数据集使用白色背景时进行重置
+                # 在设定的间隔进行透明度重置，或者如果数据集使用白色背景时进行重置
+                # 防止透明度过小导致不稳定的训练
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
-                    # 重置高斯的透明度（可能是为了避免过多高斯体积影响训练效果）
+                    # 重置高斯的透明度
                     gaussians.reset_opacity()
 
             # 执行优化步骤，更新高斯模型的参数
@@ -253,9 +256,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 
+# def prepare_output_and_logger(args):
+#     # 如果未提供模型保存路径，自动生成一个唯一的路径
+#     if not args.model_path:
+#         # 尝试从环境变量获取 OAR 作业 ID（如果1存在），用于生成唯一的文件夹名
+#         if os.getenv('OAR_JOB_ID'):
+#             unique_str = os.getenv('OAR_JOB_ID')
+#         else:
+#             # 如果没有 OAR 作业 ID，则生成一个 UUID 来作为文件夹的唯一标识
+#             unique_str = str(uuid.uuid4())
+#
+#         # 模型路径设置为 "./output/" 加上 UUID 的前 10 个字符（确保路径唯一且简短）
+#         args.model_path = os.path.join("./output/", unique_str[0:10])
+#
+#     # 打印输出路径
+#     print("Output folder: {}".format(args.model_path))
+#
+#     # 创建输出文件夹，如果文件夹已经存在，则不会抛出异常
+#     os.makedirs(args.model_path, exist_ok=True)
+#
+#     # 将当前的配置参数写入输出文件夹中的 "cfg_args" 文件，方便后续查看和追踪
+#     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+#         # 将传入的参数 (args) 转换为字典并保存到文件中
+#         cfg_log_f.write(str(Namespace(**vars(args))))
+#
+#     # 创建 TensorBoard 的日志记录器
+#     tb_writer = None
+#     if TENSORBOARD_FOUND:
+#         # 如果 TensorBoard 可用，则创建一个 TensorBoard 的 SummaryWriter
+#         tb_writer = SummaryWriter(args.model_path)
+#     else:
+#         # 如果 TensorBoard 不可用，则打印提示信息，不进行日志记录
+#         print("Tensorboard not available: not logging progress")
+#
+#     # 返回 TensorBoard writer 或 None
+#     return tb_writer
+
 def prepare_output_and_logger(args):
     # 如果未提供模型保存路径，自动生成一个唯一的路径
     if not args.model_path:
+        # 获取当前时间并格式化为 'YYYYMMDD_HHMMSS' 形式
+        current_time_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+
         # 尝试从环境变量获取 OAR 作业 ID（如果存在），用于生成唯一的文件夹名
         if os.getenv('OAR_JOB_ID'):
             unique_str = os.getenv('OAR_JOB_ID')
@@ -263,8 +305,8 @@ def prepare_output_and_logger(args):
             # 如果没有 OAR 作业 ID，则生成一个 UUID 来作为文件夹的唯一标识
             unique_str = str(uuid.uuid4())
 
-        # 模型路径设置为 "./output/" 加上 UUID 的前 10 个字符（确保路径唯一且简短）
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        # 组合时间戳和唯一标识符来生成模型保存路径
+        args.model_path = os.path.join("./output/", f"{current_time_str}_{unique_str[:10]}")
 
     # 打印输出路径
     print("Output folder: {}".format(args.model_path))
@@ -365,14 +407,14 @@ if __name__ == "__main__":  # 确保当脚本被直接执行时才会执行以�
     op = OptimizationParams(parser)  # 配置优化参数解析
     pp = PipelineParams(parser)  # 配置数据处理管道参数解析
     parser.add_argument('--ip', type=str, default="127.0.0.1")  # 设置 IP 地址（默认为本地地址）
-    parser.add_argument('--port', type=int, default=6009)  # 设置端口（默认为6009）
+    parser.add_argument('--port', type=int, default=13929)  # 设置端口（默认为13929）
     parser.add_argument('--debug_from', type=int, default=-1)  # 设置调试从哪个迭代开始（默认为-1，表示不使用调试）
     parser.add_argument('--detect_anomaly', action='store_true', default=False)  # 是否启用异常检测
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])  # 设置进行测试的迭代次数
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])  # 设置保存模型的迭代次数
     parser.add_argument("--quiet", action="store_true")  # 是否以安静模式运行（不打印多余信息）
     parser.add_argument('--disable_viewer', action='store_true', default=False)  # 是否禁用视图渲染器
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])  # 设置进行检查点保存的迭代次数
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[1_000,10_000, 20_000, 30_000])  # 设置进行检查点保存的迭代次数
     parser.add_argument("--start_checkpoint", type=str, default = None)  # 设置从哪个检查点开始训练
     args = parser.parse_args(sys.argv[1:])  # 解析命令行参数
     args.save_iterations.append(args.iterations)  # 将总的训练迭代次数添加到保存迭代次数列表中

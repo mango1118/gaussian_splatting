@@ -188,7 +188,8 @@ class GaussianModel:
         # 第0阶就是直流分量
         features[:, :3, 0 ] = fused_color
         # 高阶分量先定义为0，默认点云的点只有点的颜色
-        features[:, 3:, 1:] = 0.0
+        features[:, :3, 1:] = 0.0
+        # features[:, 3:, 1:] = 0.0
 
         # 打印初始化的点的数量
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
@@ -522,7 +523,7 @@ class GaussianModel:
         # 新的高斯分布的标准差取自于原本高斯分布的标准差，然后把他扩展成两个
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         # 新高斯分布的位置规定到全0的位置
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        means = torch.zeros((stds.size(0), 3),device="cuda")
         # 新高斯分布就通过原本的均值和标准差进行设计
         samples = torch.normal(mean=means, std=stds)
         # 创建旋转矩阵，也是根据需要分裂的高斯进行创建
